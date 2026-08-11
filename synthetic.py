@@ -170,6 +170,52 @@ class CorrectedConv2(MessagePassing):
     def message(self, x_j, norm):
         return norm * x_j
 
+
+class RandomRankOneConv(MessagePassing):
+    def __init__(self, in_channels, out_channels, num_convolutions):
+        super().__init__(aggr='add')
+        self.lin = nn.Linear(in_channels, out_channels, bias=False)
+        self.bias = nn.Parameter(torch.empty(out_channels))
+        self.num_convolutions = num_convolutions
+        self.register_buffer('random_direction', torch.empty(0))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.lin.reset_parameters()
+        self.bias.data.zero_()
+        self.random_direction = torch.empty(0, device=self.bias.device)
+
+    def _get_random_direction(self, num_nodes, device, dtype):
+        if self.random_direction.numel() != num_nodes:
+            direction = torch.randn((num_nodes, 1), device=device, dtype=dtype)
+            direction = direction / direction.norm(p=2).clamp_min(1e-12)
+            self.random_direction = direction
+        elif self.random_direction.device != device or self.random_direction.dtype != dtype:
+            self.random_direction = self.random_direction.to(device=device, dtype=dtype)
+        return self.random_direction
+
+    def forward(self, x, edge_index):
+        x = self.lin(x)
+        edge_index, _ = utils.add_remaining_self_loops(edge_index, num_nodes=x.size(0))
+        row, col = edge_index
+        deg = utils.degree(col, x.size(0), dtype=x.dtype)
+        deg_inv_sqrt = deg.pow(-0.5)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+        norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+        random_direction = self._get_random_direction(x.size(0), x.device, x.dtype)
+
+        for _ in range(self.num_convolutions):
+            rank1_comp = random_direction.T @ x
+            rank1_comp = random_direction @ rank1_comp
+            x = self.propagate(edge_index, x=x, norm=norm)
+            x -= rank1_comp
+
+        x += self.bias
+        return x
+
+    def message(self, x_j, norm):
+        return norm.view(-1, 1) * x_j
+
 class GCNConv(MessagePassing):
     def __init__(self, in_channels, out_channels, num_convolutions):
         super().__init__(aggr='add')
@@ -255,35 +301,58 @@ class GCNCorrected2(torch.nn.Module):
         return x
 
 
+class GCNRandomRankOne(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, n_layers, num_convolutions):
+        super(GCNRandomRankOne, self).__init__()
+        self.n_layers = n_layers
+        self.relu = nn.ReLU()
+        channels = [input_dim] + [hidden_dim]*(n_layers-1) + [output_dim]
+        self.module_list = []
+        for i in range(n_layers):
+            self.module_list.append(RandomRankOneConv(channels[i], channels[i+1], num_convolutions))
+        self.module_list = nn.ModuleList(self.module_list)
+
+    def forward(self, x, edge_index):
+        for (i, module) in enumerate(self.module_list):
+            x = module(x, edge_index)
+            x = self.relu(x) if i < self.n_layers - 1 else x
+        return x
+
+
 # Plotting helpers
 labels = {
     'GCN': 'Standard GCN',
     'GCNCorrected1': r'GCN with $\hat{A}$ (Ours)',
-    'GCNCorrected2': r'GCN with $\tilde{A}$'
+    'GCNCorrected2': r'GCN with $\tilde{A}$',
+    'GCNRandomRankOne': 'Random Rank-One'
 }
 
 linestyles = {
     'GCN': '--',
     'GCNCorrected1': '-',
-    'GCNCorrected2': '-.'
+    'GCNCorrected2': '-.',
+    'GCNRandomRankOne': ':'
 }
 
 linewidths = {
     'GCN': 2,
     'GCNCorrected1': 2.5,
-    'GCNCorrected2': 2
+    'GCNCorrected2': 2,
+    'GCNRandomRankOne': 2
 }
 
 markers = {
     'GCN': 'o',
     'GCNCorrected1': 's',
-    'GCNCorrected2': '^'
+    'GCNCorrected2': '^',
+    'GCNRandomRankOne': 'D'
 }
 
 colors = {
     'GCN': 'tab:blue',
     'GCNCorrected1': 'tab:red',
-    'GCNCorrected2': 'tab:green'
+    'GCNCorrected2': 'tab:green',
+    'GCNRandomRankOne': 'tab:purple'
 }
 
 def plot_with_std(x, y, yerr, label, color, linestyle='-', marker='o', linewidth=2):
@@ -340,6 +409,8 @@ def evaluate_metrics_sigma(n_trials, n, d, sigmas, p, q, num_convolutions):
     accs_gcncorrected1_stds = np.zeros(len(sigmas))
     accs_gcncorrected2_means = np.zeros(len(sigmas))
     accs_gcncorrected2_stds = np.zeros(len(sigmas))
+    accs_randomrankone_means = np.zeros(len(sigmas))
+    accs_randomrankone_stds = np.zeros(len(sigmas))
     mbar = tqdm(sigmas, desc='Varying sigma')
     for i, sigma in enumerate(mbar):
         gcn = GCN(input_dim=d, hidden_dim=1, output_dim=1, n_layers=1, num_convolutions=num_convolutions)
@@ -353,9 +424,13 @@ def evaluate_metrics_sigma(n_trials, n, d, sigmas, p, q, num_convolutions):
         gcncorrected2 = GCNCorrected2(input_dim=d, hidden_dim=1, output_dim=1, n_layers=1, num_convolutions=num_convolutions)
         accs_gcncorrected2_means[i], accs_gcncorrected2_stds[i] = experiment(n_trials, gcncorrected2, n, d, sigma, p, q, mbar)
         del gcncorrected2
+
+        gcnrandomrankone = GCNRandomRankOne(input_dim=d, hidden_dim=1, output_dim=1, n_layers=1, num_convolutions=num_convolutions)
+        accs_randomrankone_means[i], accs_randomrankone_stds[i] = experiment(n_trials, gcnrandomrankone, n, d, sigma, p, q, mbar)
+        del gcnrandomrankone
     
-    acc_means = [accs_gcn_means, accs_gcncorrected1_means, accs_gcncorrected2_means]
-    acc_stds = [accs_gcn_stds, accs_gcncorrected1_stds, accs_gcncorrected2_stds]
+    acc_means = [accs_gcn_means, accs_gcncorrected1_means, accs_gcncorrected2_means, accs_randomrankone_means]
+    acc_stds = [accs_gcn_stds, accs_gcncorrected1_stds, accs_gcncorrected2_stds, accs_randomrankone_stds]
     return acc_means, acc_stds
 
 def evaluate_metrics_gamma(n_trials, n, d, sigma, p, qs, num_convolutions):
@@ -365,6 +440,8 @@ def evaluate_metrics_gamma(n_trials, n, d, sigma, p, qs, num_convolutions):
     accs_gcncorrected1_stds = np.zeros(len(qs))
     accs_gcncorrected2_means = np.zeros(len(qs))
     accs_gcncorrected2_stds = np.zeros(len(qs))
+    accs_randomrankone_means = np.zeros(len(qs))
+    accs_randomrankone_stds = np.zeros(len(qs))
     mbar = tqdm(qs, desc='Varying gamma')
     for i, q in enumerate(mbar):
         gcn = GCN(input_dim=d, hidden_dim=1, output_dim=1, n_layers=1, num_convolutions=num_convolutions)
@@ -378,9 +455,13 @@ def evaluate_metrics_gamma(n_trials, n, d, sigma, p, qs, num_convolutions):
         gcncorrected2 = GCNCorrected2(input_dim=d, hidden_dim=1, output_dim=1, n_layers=1, num_convolutions=num_convolutions)
         accs_gcncorrected2_means[i], accs_gcncorrected2_stds[i] = experiment(n_trials, gcncorrected2, n, d, sigma, p, q, mbar)
         del gcncorrected2
+
+        gcnrandomrankone = GCNRandomRankOne(input_dim=d, hidden_dim=1, output_dim=1, n_layers=1, num_convolutions=num_convolutions)
+        accs_randomrankone_means[i], accs_randomrankone_stds[i] = experiment(n_trials, gcnrandomrankone, n, d, sigma, p, q, mbar)
+        del gcnrandomrankone
     
-    acc_means = [accs_gcn_means, accs_gcncorrected1_means, accs_gcncorrected2_means]
-    acc_stds = [accs_gcn_stds, accs_gcncorrected1_stds, accs_gcncorrected2_stds]
+    acc_means = [accs_gcn_means, accs_gcncorrected1_means, accs_gcncorrected2_means, accs_randomrankone_means]
+    acc_stds = [accs_gcn_stds, accs_gcncorrected1_stds, accs_gcncorrected2_stds, accs_randomrankone_stds]
     return acc_means, acc_stds
 
 
@@ -413,9 +494,21 @@ for num_convs in [1,2,4,8,10,12,16]:
         k_c2_mean = 'gcncorrected2_mean' if 'gcncorrected2_mean' in keys else 'gcnrob2_mean'
         k_c1_std = 'gcncorrected1_std' if 'gcncorrected1_std' in keys else 'gcnrob1_std'
         k_c2_std = 'gcncorrected2_std' if 'gcncorrected2_std' in keys else 'gcnrob2_std'
-        
-        accs_means = [data_loaded['gcn_mean'], data_loaded[k_c1_mean], data_loaded[k_c2_mean]]
-        accs_stds = [data_loaded['gcn_std'], data_loaded[k_c1_std], data_loaded[k_c2_std]]
+        has_randomrankone = 'randomrankone_mean' in keys and 'randomrankone_std' in keys
+
+        if has_randomrankone:
+            accs_means = [data_loaded['gcn_mean'], data_loaded[k_c1_mean], data_loaded[k_c2_mean], data_loaded['randomrankone_mean']]
+            accs_stds = [data_loaded['gcn_std'], data_loaded[k_c1_std], data_loaded[k_c2_std], data_loaded['randomrankone_std']]
+        else:
+            print("Existing cache does not contain Random Rank-One results. Recomputing this file.")
+            accs_means, accs_stds = evaluate_metrics_sigma(n_trials, n, d, sigmas, p, q, num_convolutions=num_convs)
+            for yaxis in accs_means:
+                for i in range(1, len(yaxis)-1):
+                    yaxis[i] = (1/3)*(yaxis[i-1] + yaxis[i] + yaxis[i+1])
+            np.savez(data_fname,
+                     ratios=ratios, sigmas=sigmas,
+                     gcn_mean=accs_means[0], gcncorrected1_mean=accs_means[1], gcncorrected2_mean=accs_means[2], randomrankone_mean=accs_means[3],
+                     gcn_std=accs_stds[0], gcncorrected1_std=accs_stds[1], gcncorrected2_std=accs_stds[2], randomrankone_std=accs_stds[3])
     else:
         accs_means, accs_stds = evaluate_metrics_sigma(n_trials, n, d, sigmas, p, q, num_convolutions=num_convs)
         for yaxis in accs_means:
@@ -423,8 +516,8 @@ for num_convs in [1,2,4,8,10,12,16]:
                 yaxis[i] = (1/3)*(yaxis[i-1] + yaxis[i] + yaxis[i+1])
         np.savez(data_fname, 
                  ratios=ratios, sigmas=sigmas,
-                 gcn_mean=accs_means[0], gcncorrected1_mean=accs_means[1], gcncorrected2_mean=accs_means[2],
-                 gcn_std=accs_stds[0], gcncorrected1_std=accs_stds[1], gcncorrected2_std=accs_stds[2])
+                 gcn_mean=accs_means[0], gcncorrected1_mean=accs_means[1], gcncorrected2_mean=accs_means[2], randomrankone_mean=accs_means[3],
+                 gcn_std=accs_stds[0], gcncorrected1_std=accs_stds[1], gcncorrected2_std=accs_stds[2], randomrankone_std=accs_stds[3])
 
     ratio_vert_1 = np.max([ratio_thres_1, C*ratio_thres_2(num_convs)])
     ratio_vert_2 = np.max([ratio_thres_3, C*ratio_thres_4(num_convs)])
@@ -463,9 +556,21 @@ for num_convs in [1,2,3,4,5,6]:
         k_c2_mean = 'gcncorrected2_mean' if 'gcncorrected2_mean' in keys else 'gcnrob2_mean'
         k_c1_std = 'gcncorrected1_std' if 'gcncorrected1_std' in keys else 'gcnrob1_std'
         k_c2_std = 'gcncorrected2_std' if 'gcncorrected2_std' in keys else 'gcnrob2_std'
-        
-        accs_means = [data_loaded['gcn_mean'], data_loaded[k_c1_mean], data_loaded[k_c2_mean]]
-        accs_stds = [data_loaded['gcn_std'], data_loaded[k_c1_std], data_loaded[k_c2_std]]
+        has_randomrankone = 'randomrankone_mean' in keys and 'randomrankone_std' in keys
+
+        if has_randomrankone:
+            accs_means = [data_loaded['gcn_mean'], data_loaded[k_c1_mean], data_loaded[k_c2_mean], data_loaded['randomrankone_mean']]
+            accs_stds = [data_loaded['gcn_std'], data_loaded[k_c1_std], data_loaded[k_c2_std], data_loaded['randomrankone_std']]
+        else:
+            print("Existing cache does not contain Random Rank-One results. Recomputing this file.")
+            accs_means, accs_stds = evaluate_metrics_gamma(n_trials, n, d, sigma, p, qs, num_convolutions=num_convs)
+            for yaxis in accs_means:
+                for i in range(1, len(yaxis)-1):
+                    yaxis[i] = (1/3)*(yaxis[i-1] + yaxis[i] + yaxis[i+1])
+            np.savez(data_fname,
+                     gammas=gammas,
+                     gcn_mean=accs_means[0], gcncorrected1_mean=accs_means[1], gcncorrected2_mean=accs_means[2], randomrankone_mean=accs_means[3],
+                     gcn_std=accs_stds[0], gcncorrected1_std=accs_stds[1], gcncorrected2_std=accs_stds[2], randomrankone_std=accs_stds[3])
     else:
         accs_means, accs_stds = evaluate_metrics_gamma(n_trials, n, d, sigma, p, qs, num_convolutions=num_convs)
         for yaxis in accs_means:
@@ -473,8 +578,8 @@ for num_convs in [1,2,3,4,5,6]:
                 yaxis[i] = (1/3)*(yaxis[i-1] + yaxis[i] + yaxis[i+1])
         np.savez(data_fname, 
                  gammas=gammas, 
-                 gcn_mean=accs_means[0], gcncorrected1_mean=accs_means[1], gcncorrected2_mean=accs_means[2],
-                 gcn_std=accs_stds[0], gcncorrected1_std=accs_stds[1], gcncorrected2_std=accs_stds[2])
+                 gcn_mean=accs_means[0], gcncorrected1_mean=accs_means[1], gcncorrected2_mean=accs_means[2], randomrankone_mean=accs_means[3],
+                 gcn_std=accs_stds[0], gcncorrected1_std=accs_stds[1], gcncorrected2_std=accs_stds[2], randomrankone_std=accs_stds[3])
                  
     vert_lines = [[gamma_thres_1(num_convs), r'GCN with $\tilde{A}$ threshold', colors['GCNCorrected2'], '-'],
                   [gamma_thres_2(num_convs), r'GCN with $\hat{A}$ threshold', colors['GCNCorrected1'], '--']]
